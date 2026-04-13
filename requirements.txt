@@ -1,0 +1,10 @@
+streamlit
+pandas
+PyPDF2
+sentence-transformers
+faiss-cpu
+numpy
+google-generativeai
+huggingface_hub
+python-dotenv
+groq
