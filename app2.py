@@ -28,7 +28,7 @@ st.markdown(
 
     /* ── Layout width ── */
     .block-container {
-        max-width: 1200px !important;
+        max-width: 1000px !important;
         padding-left: 3rem !important;
         padding-right: 3rem !important;
         padding-top: 4rem !important;
