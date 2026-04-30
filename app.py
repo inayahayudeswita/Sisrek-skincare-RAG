@@ -1,494 +1,830 @@
 import os
 import re
-import html
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import faiss
-import numpy as np
 import pandas as pd
-import PyPDF2
 import streamlit as st
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 
 # =====================================================
-# 1. PAGE CONFIG & STYLE
+# 1. PAGE CONFIG
 # =====================================================
-st.set_page_config(
-    page_title="GlowAI - Skincare Expert",
-    page_icon="✨",
-    layout="centered",
-)
+st.set_page_config(page_title="GlowAI", page_icon="✨", layout="centered")
 
 st.markdown(
     """
-<style>
-.stApp { background-color:#ffffff; }
-.main-header { text-align:center; margin-bottom:2rem; }
-.main-header h1 { color:#008080; font-weight:800; }
-.result-card {
-    background:#f0fdf4;
-    padding:20px;
-    border-radius:10px;
-    border-left: 5px solid #008080;
-    margin-top:20px;
-    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-}
-.result-card h3 { color: #008080; }
-.warning-card {
-    background:#fff3cd;
-    padding:15px;
-    border-radius:10px;
-    border:1px solid #ffeeba;
-    color:#856404;
-}
-.info-card {
-    background:#eef6ff;
-    padding:15px;
-    border-radius:10px;
-    border:1px solid #cfe2ff;
-    color:#084298;
-}
-small.muted { color:#666666; }
-</style>
-""",
+    <style>
+    .main-title { text-align:center; margin-bottom: 0.5rem; }
+    .subtitle { text-align:center; color:#666; margin-bottom: 1.5rem; }
+    .info-box {
+        background:#eef6ff; padding:14px 16px; border-radius:10px;
+        border:1px solid #cfe2ff; margin-bottom:1rem;
+    }
+    .result-box {
+        background:#f8fff8; padding:18px; border-radius:10px;
+        border-left:5px solid #198754; margin-top:1rem;
+    }
+    .warning-box {
+        background:#fff8e6; padding:14px 16px; border-radius:10px;
+        border:1px solid #ffe2a8; margin-top:1rem;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown("<h1 class='main-title'>✨ GlowAI Skincare Expert</h1>", unsafe_allow_html=True)
+st.markdown(
+    "<div class='subtitle'>Sistem rekomendasi skincare berbasis RAG, FAISS, dan LLM</div>",
     unsafe_allow_html=True,
 )
 
 # =====================================================
-# 2. FINAL MODEL CONFIGURATION
+# 2. CONFIG
 # =====================================================
-FINAL_MODEL_NAME = "Llama 3.3 70B"
-FINAL_MODEL_ID = "llama-3.3-70b-versatile"
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+PRIMARY_MODEL_ID = "llama-3.3-70b-versatile"
+EMBED_MODEL = "all-MiniLM-L6-v2"
+
+CSV_PATH = "datasets/dokumen_produk.csv"
+JOURNAL_CSV_PATH = "datasets/jurnal_chunk.csv"
+
+INITIAL_RETRIEVAL = 50
+TOPK_CONTEXT = 5
+MIN_SIMILARITY_SCORE = 0.25
+
+MAX_INPUT_CHARS = 500
+DEFAULT_RECOMMENDATION_COUNT = 3
+MAX_RECOMMENDATION_COUNT = 5
+MAX_CONTEXT_CHARS_PER_DOC = 1200
+MAX_OUTPUT_TOKENS = 1200
+
+ALLOWED_CATEGORIES = ["facewash", "toner", "serum", "moisturizer"]
 
 # =====================================================
-# 3. INITIALIZATION
+# 3. CLIENT
 # =====================================================
 groq_key = st.secrets.get("GROQ_API_KEY", "")
 if not groq_key:
-    st.error("❌ GROQ_API_KEY tidak ditemukan di secrets.toml")
+    st.error("GROQ_API_KEY tidak ditemukan di secrets.toml")
     st.stop()
 
 client = Groq(api_key=groq_key)
 
+# =====================================================
+# 4. BASIC HELPERS
+# =====================================================
+def format_rp(x: Optional[float]) -> str:
+    if x is None or pd.isna(x):
+        return "Harga tidak tersedia"
+    return f"Rp{int(x):,}".replace(",", ".")
 
-def safe_float_price(value: object) -> Optional[float]:
-    """
-    Convert various price formats to float.
-    Supports:
-    - 50000
-    - 50.000
-    - Rp 50.000
-    - Rp50,000
-    Returns None if parsing fails.
-    """
-    if value is None or (isinstance(value, float) and np.isnan(value)):
+
+def parse_price(val: Any) -> Optional[float]:
+    if val is None or pd.isna(val):
         return None
 
-    text = str(value).strip().lower()
-    if not text:
+    raw = str(val).lower().strip()
+
+    if raw in ["", "-", "nan", "none", "tidak tersedia", "harga tidak tersedia"]:
         return None
 
-    # keep digits only
-    digits = re.sub(r"[^\d]", "", text)
+    digits = re.sub(r"[^\d]", "", raw)
+
     if not digits:
         return None
 
-    try:
-        return float(digits)
-    except ValueError:
+    price = float(digits)
+
+    if price <= 0:
         return None
 
-
-def format_rupiah(value: Optional[float]) -> str:
-    if value is None:
-        return "Harga tidak tersedia"
-    return f"Rp{int(value):,}".replace(",", ".")
+    return price
 
 
-def extract_budget(query: str) -> Optional[float]:
-    """
-    Extract budget from Indonesian query.
-    Examples:
-    - di bawah 50rb
-    - budget 100 ribu
-    - under 150000
-    - < 50000
-    """
-    q = query.lower().strip().replace(".", "")
+def extract_field(text: str, field_name: str) -> str:
+    pattern = rf"{re.escape(field_name)}\s*:\s*(.*)"
+    match = re.search(pattern, text, flags=re.IGNORECASE)
+    return match.group(1).strip() if match else ""
+
+
+def normalize_category(category: str) -> str:
+    c = str(category).lower().strip()
+
+    if "serum" in c:
+        return "serum"
+    if "toner" in c:
+        return "toner"
+    if "moisturizer" in c or "pelembap" in c or "pelembab" in c:
+        return "moisturizer"
+    if "facewash" in c or "face wash" in c or "cleanser" in c or "sabun wajah" in c:
+        return "facewash"
+
+    return c
+
+
+def extract_budget(text: str) -> Optional[float]:
+    t = text.lower().replace(".", "").replace(",", "").strip()
 
     patterns = [
-        r"(?:dibawah|di bawah|kurang dari|under|maksimal|max|budget)\s*rp?\s*(\d+)\s*(rb|ribu|k)?",
-        r"<\s*rp?\s*(\d+)\s*(rb|ribu|k)?",
-        r"budget\s*(?:di bawah)?\s*rp?\s*(\d+)\s*(rb|ribu|k)?",
+        r"(?:di bawah|dibawah|kurang dari|maksimal|max|under|<)\s*(?:rp\s*)?(\d+)\s*(rb|ribu|k|000)?",
+        r"budget\s*(?:di bawah|dibawah|kurang dari|maksimal|max|under|<)?\s*(?:rp\s*)?(\d+)\s*(rb|ribu|k|000)?",
+        r"(?:harga|budget)\s*(?:maksimal|max)?\s*(?:rp\s*)?(\d+)\s*(rb|ribu|k|000)?",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, q)
-        if match:
-            amount = float(match.group(1))
-            unit = match.group(2)
-            if unit in {"rb", "ribu", "k"}:
+        m = re.search(pattern, t)
+        if m:
+            amount = float(m.group(1))
+            unit = m.group(2)
+
+            if unit in {"rb", "ribu", "k", "000"}:
                 amount *= 1000
+
+            # Dalam konteks skincare Indonesia, "90 ribu" kadang ditulis "90".
+            if amount < 1000:
+                amount *= 1000
+
             return amount
 
     return None
 
 
-def is_skincare_topic(text: str) -> bool:
-    """
-    Rule-based topical guardrail.
-    """
-    keywords = [
-        "kulit", "wajah", "jerawat", "kusam", "beruntusan", "komedo",
-        "minyak", "berminyak", "kering", "sensitif", "iritasi", "pori",
-        "bekas jerawat", "flek", "skin barrier", "skincare", "serum",
-        "toner", "moisturizer", "pelembap", "facial wash", "cleanser",
-        "face wash", "sunscreen", "exfoliating", "salicylic", "niacinamide",
-        "budget", "harga", "murah", "mahal"
+def extract_requested_count(text: str) -> int:
+    t = text.lower()
+
+    patterns = [
+        r"(?:rekomendasikan|berikan|kasih|tampilkan|carikan)\s+(\d+)",
+        r"(\d+)\s+(?:produk|serum|toner|moisturizer|pelembap|pelembab|cleanser|facial wash|face wash)",
     ]
-    lowered = text.lower()
-    return any(k in lowered for k in keywords)
+
+    for pattern in patterns:
+        m = re.search(pattern, t)
+        if m:
+            try:
+                n = int(m.group(1))
+                return max(1, min(n, MAX_RECOMMENDATION_COUNT))
+            except ValueError:
+                pass
+
+    return DEFAULT_RECOMMENDATION_COUNT
 
 
-def detect_requested_category(query: str) -> Optional[str]:
-    q = query.lower()
-    category_map = {
+def detect_category(text: str) -> Optional[str]:
+    t = text.lower()
+
+    mapping = {
         "serum": ["serum"],
         "toner": ["toner", "exfoliating toner"],
         "moisturizer": ["moisturizer", "pelembap", "pelembab"],
-        "facial wash": ["facial wash", "face wash", "cleanser", "sabun wajah"],
+        "facewash": ["facewash", "facial wash", "face wash", "cleanser", "sabun wajah"],
     }
-    for canonical, aliases in category_map.items():
-        if any(alias in q for alias in aliases):
-            return canonical
+
+    for cat, aliases in mapping.items():
+        if any(alias in t for alias in aliases):
+            return cat
+
     return None
 
 
-@st.cache_resource
-def load_resources() -> Tuple[SentenceTransformer, faiss.IndexFlatIP, List[dict], pd.DataFrame]:
-    """
-    Load processed CSV + PDF knowledge base, then build FAISS index.
-
-    Expected CSV: datasets/dokumen_produk.csv
-    Recommended columns:
-    - category
-    - brand
-    - product_name
-    - price
-    - product_url
-    - serialized_text or document/text in second column
-    """
-    embedder = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    documents: List[dict] = []
-
-    csv_path = "datasets/dokumen_produk.csv"
-    pdf_path = "datasets/jurnal_chunk.pdf"
-
-    # -------- Load CSV product docs --------
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"File CSV tidak ditemukan: {csv_path}")
-
-    df = pd.read_csv(csv_path)
-
-    # normalize columns
-    df.columns = [str(c).strip() for c in df.columns]
-
-    for _, row in df.iterrows():
-        row_dict = row.to_dict()
-
-        # Flexible text source
-        text_content = None
-        for candidate in ["serialized_text", "document", "text", "dokumen", "content"]:
-            if candidate in df.columns and pd.notna(row_dict.get(candidate)):
-                text_content = str(row_dict[candidate]).strip()
-                break
-
-        if text_content is None:
-            # fallback to 2nd column if available
-            if len(df.columns) > 1 and pd.notna(row.iloc[1]):
-                text_content = str(row.iloc[1]).strip()
-
-        if not text_content:
-            continue
-
-        category = str(row_dict.get("category", "")).strip().lower()
-        brand = str(row_dict.get("brand", "")).strip()
-        product_name = str(row_dict.get("product_name", row_dict.get("name", ""))).strip()
-        product_url = str(row_dict.get("product_url", "")).strip()
-        raw_price = row_dict.get("price", row_dict.get("harga"))
-        price_value = safe_float_price(raw_price)
-
-        prefixed_text = (
-            f"[SUMBER: DATABASE PRODUK] "
-            f"[KATEGORI: {category or 'tidak diketahui'}] "
-            f"[NAMA: {product_name or 'tidak diketahui'}] "
-            f"[BRAND: {brand or 'tidak diketahui'}] "
-            f"[HARGA: {format_rupiah(price_value)}] "
-            f"{text_content}"
-        )
-
-        documents.append(
-            {
-                "source": "produk",
-                "category": category,
-                "product_name": product_name,
-                "brand": brand,
-                "price": price_value,
-                "product_url": product_url,
-                "text": prefixed_text,
-            }
-        )
-
-    # -------- Load PDF dermatology docs --------
-    if os.path.exists(pdf_path):
-        reader = PyPDF2.PdfReader(pdf_path)
-        full_text = ""
-        for page in reader.pages:
-            extracted = page.extract_text() or ""
-            full_text += extracted + "\n"
-
-        chunk_size = 700
-        overlap = 50
-        start = 0
-        while start < len(full_text):
-            chunk = full_text[start:start + chunk_size].replace("\n", " ").strip()
-            if chunk:
-                documents.append(
-                    {
-                        "source": "jurnal",
-                        "category": "",
-                        "product_name": "",
-                        "brand": "",
-                        "price": None,
-                        "product_url": "",
-                        "text": f"[SUMBER: JURNAL DERMATOLOGI] {chunk}",
-                    }
-                )
-            start += max(1, chunk_size - overlap)
-
-    if not documents:
-        raise ValueError("Tidak ada dokumen yang berhasil dimuat.")
-
-    corpus = [doc["text"] for doc in documents]
-    embeddings = embedder.encode(corpus, convert_to_numpy=True)
-    faiss.normalize_L2(embeddings)
-
-    index = faiss.IndexFlatIP(embeddings.shape[1])
-    index.add(embeddings)
-
-    return embedder, index, documents, df
-
-
-try:
-    embedder, faiss_index, all_documents, source_df = load_resources()
-except Exception as e:
-    st.error(f"Gagal memuat resource: {e}")
-    st.stop()
-
-# =====================================================
-# 4. RULE-BASED GUARDRAILS
-# =====================================================
-def validate_input(query: str) -> Tuple[bool, str]:
-    """
-    Rule-based input guardrails aligned with Chapter IV:
-    - domain restriction to skincare
-    - basic harmful/non-topic blocking
-    """
-    q = query.strip()
-    if not q:
-        return False, "Mohon isi keluhan atau kebutuhan skincare terlebih dahulu."
-
-    if len(q) < 8:
-        return False, "Input terlalu singkat. Mohon jelaskan kondisi kulit atau kebutuhan skincare Anda."
-
-    if not is_skincare_topic(q):
-        return False, "Maaf, sistem hanya melayani pertanyaan seputar skincare dan perawatan kulit."
-
-    blocked_patterns = [
-        r"\bdiagnosa\b",
-        r"\bresep obat\b",
-        r"\bobat keras\b",
-        r"\bpenyakit berat\b",
-        r"\boperasi\b",
+def is_skincare_topic(text: str) -> bool:
+    keywords = [
+        "kulit", "wajah", "skincare", "jerawat", "beruntusan", "bruntusan",
+        "komedo", "kusam", "kering", "berminyak", "sensitif", "iritasi",
+        "pori", "bekas jerawat", "flek", "noda hitam", "acne",
+        "oily", "dry skin", "sensitive skin", "mengencangkan", "kendur",
+        "anti aging", "anti-aging", "kerutan", "garis halus",
+        "serum", "toner", "moisturizer", "pelembap", "pelembab",
+        "cleanser", "facial wash", "facewash", "sabun wajah",
+        "budget", "harga", "murah", "normal", "t-zone", "kombinasi",
     ]
-    for pattern in blocked_patterns:
-        if re.search(pattern, q.lower()):
-            return False, "Sistem ini berfungsi sebagai pendukung keputusan skincare dan tidak memberikan diagnosis medis profesional."
 
-    return True, "Input valid."
+    t = text.lower()
+    return any(k in t for k in keywords)
 
 
-def is_output_valid(response: str) -> bool:
-    """
-    Simple output validation / fallback trigger.
-    """
-    if not response or len(response.strip()) < 50:
+def validate_input(text: str) -> Tuple[bool, str]:
+    cleaned = text.strip()
+
+    if not cleaned:
+        return False, "Mohon isi pertanyaan terlebih dahulu."
+
+    if len(cleaned) < 8:
+        return False, "Input terlalu singkat."
+
+    if len(cleaned) > MAX_INPUT_CHARS:
+        return False, f"Input terlalu panjang. Maksimal {MAX_INPUT_CHARS} karakter."
+
+    if not is_skincare_topic(cleaned):
+        return False, "GlowAI hanya melayani pertanyaan seputar skincare."
+
+    medical_terms = r"\b(diagnosa|diagnosis|obat keras|resep|penyakit serius|psoriasis|eksim|infeksi|nanah parah)\b"
+    if re.search(medical_terms, cleaned.lower()):
+        return False, "GlowAI tidak memberikan diagnosis medis profesional. Silakan konsultasikan kondisi tersebut ke dokter."
+
+    return True, ""
+
+
+def valid_output(text: str) -> bool:
+    if not text or len(text.strip()) < 80:
         return False
 
-    required_markers = [
-        "Analisis Kulit",
-        "Rekomendasi",
-    ]
-    if not any(marker.lower() in response.lower() for marker in required_markers):
+    lowered = text.lower()
+    return ("analisis kulit" in lowered) and ("rekomendasi" in lowered)
+
+def answer_looks_incomplete(text: str) -> bool:
+    stripped = text.strip()
+    lowered = stripped.lower()
+
+    if not stripped:
+        return True
+
+    incomplete_endings = (
+        "link",
+        "link produk",
+        "alasan medis",
+        "kandungan kunci",
+        "harga",
+        "dengan",
+        "dan",
+        "serta",
+        "karena",
+        "untuk",
+        "http",
+        "https://reviews.f",
+    )
+
+    if any(lowered.endswith(x) for x in incomplete_endings):
+        return True
+
+    return "### catatan" not in lowered and "catatan" not in lowered
+
+def answer_violates_budget(answer: str, budget: Optional[float]) -> bool:
+    if budget is None:
         return False
 
-    suspicious_patterns = [
-        r"saya tidak tahu",
-        r"di luar konteks",
-        r"tidak ada informasi",
+    price_patterns = [
+        r"rp\.?\s*(\d{1,3}(?:[.,]\d{3})+|\d+)",
+        r"harga\s*:\s*(\d{1,3}(?:[.,]\d{3})+|\d+)",
     ]
-    suspicious_hits = sum(bool(re.search(p, response.lower())) for p in suspicious_patterns)
 
-    # allow some uncertainty, but not too much
-    if suspicious_hits >= 2:
+    for pattern in price_patterns:
+        for m in re.finditer(pattern, answer.lower()):
+            price = parse_price(m.group(1))
+            if price is not None and price > budget:
+                return True
+
+    return False
+
+def shorten_text(text: str, max_chars: int = MAX_CONTEXT_CHARS_PER_DOC) -> str:
+    text = str(text).strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + "..."
+
+
+def count_product_docs(docs: List[Dict[str, Any]]) -> int:
+    return sum(1 for d in docs if d.get("source") == "produk")
+
+def count_journal_docs(docs: List[Dict[str, Any]]) -> int:
+    return sum(1 for d in docs if d.get("source") == "jurnal")
+
+def product_matches_constraints(
+    doc: Dict[str, Any],
+    category: Optional[str],
+    budget: Optional[float],
+) -> bool:
+    if doc.get("source") != "produk":
         return False
+
+    if category and doc.get("category") != category:
+        return False
+
+    if budget is not None:
+        price = doc.get("price")
+        if price is None or price > budget:
+            return False
 
     return True
 
 
-def fallback_response(user_query: str, budget: Optional[float]) -> str:
-    budget_note = ""
-    if budget is not None:
-        budget_note = f" dengan batas harga sekitar {format_rupiah(budget)}"
+def select_context_docs(
+    product_results: List[Dict[str, Any]],
+    journal_results: List[Dict[str, Any]],
+    k: int = TOPK_CONTEXT,
+) -> List[Dict[str, Any]]:
 
-    return f"""
-### Analisis Kulit
-Sistem belum dapat menghasilkan tiga rekomendasi yang sepenuhnya sesuai untuk kebutuhan Anda{budget_note} berdasarkan basis pengetahuan yang tersedia.
+    journal_slots = 1 if journal_results and product_results else 0
+    product_slots = max(0, k - journal_slots)
+
+    selected = product_results[:product_slots]
+
+    if journal_slots:
+        selected.append(journal_results[0])
+
+    return selected[:k]
+
+
+
+# =====================================================
+# 5. CLINICAL HELPERS
+# =====================================================
+def detect_skin_concerns(text: str) -> List[str]:
+    t = text.lower()
+    concerns = []
+
+    if any(k in t for k in ["jerawat meradang", "jerawat radang", "nyeri", "sakit", "bengkak", "meradang"]):
+        concerns.append("inflamed_acne")
+
+    if any(k in t for k in ["jerawat", "acne", "komedo"]):
+        concerns.append("acne")
+
+    if any(k in t for k in ["bruntusan", "beruntusan", "closed comedone", "komedo tertutup"]):
+        concerns.append("comedonal_acne")
+
+    if any(k in t for k in ["bekas jerawat", "noda hitam", "flek", "hiperpigmentasi", "kusam", "hitam"]):
+        concerns.append("hyperpigmentation")
+
+    if any(k in t for k in ["kering", "ketarik", "dehidrasi", "mengelupas"]):
+        concerns.append("dry_skin")
+
+    if any(k in t for k in ["sensitif", "iritasi", "mudah merah", "perih", "reaktif"]):
+        concerns.append("sensitive_skin")
+
+    if any(k in t for k in ["pori", "pori-pori"]):
+        concerns.append("large_pores")
+
+    if any(k in t for k in ["kulit normal", "normal skin", "menjaga kesehatan", "maintenance"]):
+        concerns.append("normal_skin")
+
+    if any(k in t for k in ["kombinasi", "t-zone", "t zone", "pipi kering"]):
+        concerns.append("combination_skin")
+
+    if any(k in t for k in ["berminyak", "oily", "minyak berlebih"]):
+        concerns.append("oily_skin")
+
+    return list(set(concerns))
+
+
+def clinical_score_boost(doc_text: str, concerns: List[str]) -> float:
+    t = doc_text.lower()
+    boost = 0.0
+
+    beneficial = {
+        "inflamed_acne": [
+            "benzoyl peroxide", "salicylic acid", "bha", "azelaic acid",
+            "niacinamide", "centella", "cica", "sulfur", "zinc",
+        ],
+        "acne": [
+            "salicylic acid", "bha", "niacinamide", "zinc", "tea tree",
+            "azelaic acid", "centella", "cica",
+        ],
+        "comedonal_acne": [
+            "salicylic acid", "bha", "retinol", "glycolic acid", "lactic acid",
+        ],
+        "hyperpigmentation": [
+            "vitamin c", "niacinamide", "alpha arbutin", "arbutin",
+            "azelaic acid", "tranexamic acid", "licorice", "retinol",
+        ],
+        "dry_skin": [
+            "hyaluronic acid", "glycerin", "ceramide", "panthenol",
+            "squalane", "aloe", "centella", "cica",
+        ],
+        "sensitive_skin": [
+            "centella", "cica", "panthenol", "ceramide", "aloe",
+            "hyaluronic acid", "oat", "allantoin",
+        ],
+        "large_pores": [
+            "salicylic acid", "bha", "niacinamide", "zinc", "retinol",
+        ],
+        "combination_skin": [
+            "hyaluronic acid", "glycerin", "niacinamide", "ceramide",
+            "gel", "lightweight", "ringan",
+        ],
+        "normal_skin": [
+            "hyaluronic acid", "glycerin", "ceramide", "centella",
+            "panthenol", "moisturizing", "hydrating",
+        ],
+        "oily_skin": [
+            "niacinamide", "salicylic acid", "bha", "zinc", "oil control",
+            "sebum",
+        ],
+    }
+
+    risky = {
+        "sensitive_skin": [
+            "retinol", "aha", "bha", "glycolic acid", "lactic acid",
+            "fragrance", "parfum", "alcohol denat",
+        ],
+        "dry_skin": [
+            "alcohol denat", "high alcohol", "strong exfoliating",
+        ],
+        "normal_skin": [
+            "retinol", "aha", "bha", "salicylic acid", "glycolic acid",
+            "lactic acid", "exfoliating",
+        ],
+        "inflamed_acne": [
+            "bengkoang", "whitening only", "brightening only",
+        ],
+    }
+
+    for concern in concerns:
+        for ingredient in beneficial.get(concern, []):
+            if ingredient in t:
+                boost += 0.08
+
+        for ingredient in risky.get(concern, []):
+            if ingredient in t:
+                boost -= 0.10
+
+    if any(c in concerns for c in ["inflamed_acne", "acne", "comedonal_acne"]) and "bengkoang" in t:
+        boost -= 0.12
+
+    return boost
+
+
+def generate_safety_notes(concerns: List[str], category: Optional[str]) -> str:
+    notes = []
+
+    if "hyperpigmentation" in concerns:
+        notes.append("- Untuk bekas jerawat/noda hitam, gunakan sunscreen pada pagi/siang hari agar hasil perawatan lebih optimal.")
+
+    if "sensitive_skin" in concerns:
+        notes.append("- Untuk kulit sensitif, pilih produk yang minim iritan dan lakukan patch test sebelum pemakaian rutin.")
+
+    if "dry_skin" in concerns:
+        notes.append("- Untuk kulit kering yang terasa ketarik, fokus pada hidrasi dan perbaikan skin barrier.")
+
+    if "inflamed_acne" in concerns:
+        notes.append("- Jika jerawat meradang terasa nyeri, luas, bernanah, atau tidak membaik, sebaiknya konsultasi ke dokter kulit.")
+
+    if "comedonal_acne" in concerns:
+        notes.append("- Produk eksfoliasi sebaiknya digunakan bertahap, misalnya 2-3 kali per minggu terlebih dahulu.")
+
+    if "large_pores" in concerns:
+        notes.append("- Pori-pori tidak dapat dikecilkan permanen, tetapi tampilannya dapat dibantu dengan kontrol minyak dan perawatan pori.")
+
+    if "normal_skin" in concerns:
+        notes.append("- Untuk kulit normal, hindari penggunaan bahan aktif terlalu banyak agar tidak terjadi over-treatment.")
+
+    if category == "toner":
+        notes.append("- Hindari penggunaan toner eksfoliasi bersamaan dengan retinol atau exfoliant lain pada malam yang sama.")
+
+    return "\n".join(notes[:2])
+
+
+def fallback_response(
+    jumlah_produk: int,
+    category: Optional[str] = None,
+    budget: Optional[float] = None,
+    concerns: Optional[List[str]] = None,
+) -> str:
+    category_text = f" kategori **{category}**" if category else ""
+    budget_text = f" dengan budget **di bawah {format_rp(budget)}**" if budget is not None else ""
+    safety = generate_safety_notes(concerns or [], category)
+
+    return f"""### Analisis Kulit
+Sistem belum menemukan rekomendasi{category_text}{budget_text} yang sepenuhnya sesuai berdasarkan basis pengetahuan yang tersedia.
 
 ### Rekomendasi
-Mohon perjelas kondisi kulit Anda, misalnya jenis masalah utama, kategori produk yang diinginkan, atau batas budget yang lebih fleksibel. Sistem hanya memberikan rekomendasi berdasarkan data produk dan referensi dermatologi yang tersedia pada basis pengetahuan.
-""".strip()
+Tidak ditemukan produk yang memenuhi seluruh batasan pengguna pada data yang tersedia.
+
+### Catatan
+Silakan perluas budget, ubah kategori produk, atau jelaskan kondisi kulit dengan lebih spesifik. Rekomendasi disesuaikan dengan data yang tersedia pada basis pengetahuan sistem.
+{safety}
+"""
+
 
 # =====================================================
-# 5. RETRIEVAL + RE-RANKING
+# 6. LOAD RESOURCES
 # =====================================================
-def base_retrieve_docs(query: str, k: int = 30) -> List[dict]:
+@st.cache_resource
+def load_resources():
+    embedder = SentenceTransformer(EMBED_MODEL)
+
+    df = pd.read_csv(CSV_PATH)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    docs: List[Dict[str, Any]] = []
+
+    for _, row in df.iterrows():
+        text = str(row.get("dokumen", "")).strip()
+        if not text:
+            continue
+        if "discontinued" in text.lower():
+            continue
+
+        name = extract_field(text, "Nama Produk")
+        brand = extract_field(text, "Brand")
+        category_raw = extract_field(text, "Kategori")
+        category = normalize_category(category_raw)
+
+        raw_price = extract_field(text, "Harga")
+        url = (
+            extract_field(text, "Link Produk")
+            or extract_field(text, "Link")
+            or extract_field(text, "URL")
+        )
+
+        price = parse_price(raw_price)
+
+        if category and category not in ALLOWED_CATEGORIES:
+            continue
+
+        full = (
+            f"[SUMBER: DATABASE PRODUK] "
+            f"[KATEGORI: {category}] "
+            f"[NAMA: {name}] "
+            f"[BRAND: {brand}] "
+            f"[HARGA: {raw_price if raw_price else 'Harga tidak tersedia'}] "
+            f"[LINK: {url if url else 'Link tidak tersedia'}] "
+            f"{text}"
+        )
+
+        docs.append({
+            "source": "produk",
+            "category": category,
+            "product_name": name,
+            "brand": brand,
+            "price": price,
+            "raw_price": raw_price,
+            "url": url,
+            "text": full,
+        })
+
+    if os.path.exists(JOURNAL_CSV_PATH):
+        journal_df = pd.read_csv(JOURNAL_CSV_PATH)
+        journal_df.columns = [str(c).strip() for c in journal_df.columns]
+
+        for _, row in journal_df.iterrows():
+            topic = str(row.get("topic", "general_dermatology")).strip()
+            source_file = str(row.get("source_file", "unknown_source")).strip()
+            page = str(row.get("page", "")).strip()
+            chunk_id = str(row.get("new_chunk_id", row.get("chunk_id", ""))).strip()
+            text = str(row.get("text", "")).strip()
+
+            if not text:
+                continue
+
+            docs.append({
+                "source": "jurnal",
+                "category": "",
+                "product_name": "",
+                "brand": "",
+                "price": None,
+                "raw_price": "",
+                "url": "",
+                "topic": topic,
+                "source_file": source_file,
+                "page": page,
+                "chunk_id": chunk_id,
+                "text": (
+                    f"[SUMBER: JURNAL DERMATOLOGI] "
+                    f"[TOPIK: {topic}] "
+                    f"[FILE: {source_file}] "
+                    f"[HALAMAN: {page}] "
+                    f"[CHUNK: {chunk_id}] "
+                    f"{text}"
+                ),
+            })
+
+    if not docs:
+        raise ValueError("Tidak ada dokumen yang berhasil dimuat.")
+
+    corpus = [d["text"] for d in docs]
+    emb = embedder.encode(corpus, convert_to_numpy=True)
+    faiss.normalize_L2(emb)
+
+    index = faiss.IndexFlatIP(emb.shape[1])
+    index.add(emb)
+
+    journal_docs = [d for d in docs if d.get("source") == "jurnal"]
+    journal_index = None
+
+    if journal_docs:
+        journal_corpus = [d["text"] for d in journal_docs]
+        journal_emb = embedder.encode(journal_corpus, convert_to_numpy=True)
+        faiss.normalize_L2(journal_emb)
+
+        journal_index = faiss.IndexFlatIP(journal_emb.shape[1])
+        journal_index.add(journal_emb)
+
+    return embedder, index, docs, journal_index, journal_docs
+
+try:
+    embedder, index, all_docs, journal_index, journal_docs = load_resources()
+except Exception as e:
+    st.error(f"Gagal memuat resource: {e}")
+    st.stop()
+
+st.caption(
+    f"Total dokumen: {len(all_docs)} | "
+    f"Produk: {sum(1 for d in all_docs if d.get('source') == 'produk')} | "
+    f"Jurnal: {sum(1 for d in all_docs if d.get('source') == 'jurnal')}"
+)
+
+
+# =====================================================
+# 7. RETRIEVAL
+# =====================================================
+def retrieve(query: str, k: int = TOPK_CONTEXT) -> List[Dict[str, Any]]:
     qv = embedder.encode([query], convert_to_numpy=True)
     faiss.normalize_L2(qv)
-    scores, idxs = faiss_index.search(qv, k)
 
-    results = []
-    for score, idx in zip(scores[0], idxs[0]):
+    scores, ids = index.search(qv, INITIAL_RETRIEVAL)
+
+    budget = extract_budget(query)
+    category = detect_category(query)
+    concerns = detect_skin_concerns(query)
+
+    product_results = []
+    journal_results = []
+
+    for score, idx in zip(scores[0], ids[0]):
         if idx < 0:
             continue
-        doc = dict(all_documents[idx])
-        doc["base_score"] = float(score)
-        results.append(doc)
-    return results
 
+        doc = dict(all_docs[idx])
+        base_score = float(score)
+        final_score = base_score
 
-def rerank_docs(
-    query: str,
-    docs: List[dict],
-    budget: Optional[float],
-    requested_category: Optional[str],
-    final_k: int = 15,
-) -> List[dict]:
-    """
-    Simple rule-based hybrid retrieval aligned with Chapter IV:
-    - semantic similarity from FAISS
-    - category preference
-    - budget preference / boost
-    """
-    reranked = []
+        if doc["source"] == "produk":
+            if base_score < MIN_SIMILARITY_SCORE:
+                continue
 
-    for doc in docs:
-        score = doc.get("base_score", 0.0)
+            if not product_matches_constraints(doc, category, budget):
+                continue
 
-        # boost category match for product docs
-        if requested_category and doc["source"] == "produk":
-            if requested_category in (doc.get("category") or ""):
-                score += 0.10
+            if budget is not None:
+                final_score += 0.20
 
-        # boost budget-compatible docs
-        price = doc.get("price")
-        if budget is not None and doc["source"] == "produk" and price is not None:
-            if price <= budget:
-                score += 0.20
-            else:
-                score -= 0.15
+            final_score += clinical_score_boost(doc.get("text", ""), concerns)
 
-        # give slight priority to journal chunks to keep medical grounding
-        if doc["source"] == "jurnal":
-            score += 0.03
+            doc["base_score"] = base_score
+            doc["score"] = final_score
+            product_results.append(doc)
 
-        doc["hybrid_score"] = score
-        reranked.append(doc)
+        elif doc["source"] == "jurnal":
+            if base_score < 0.10:
+                continue
 
-    reranked.sort(key=lambda x: x["hybrid_score"], reverse=True)
-    return reranked[:final_k]
+            doc["base_score"] = base_score
+            doc["score"] = final_score + 0.03
+            journal_results.append(doc)
 
+    if journal_index is not None and journal_docs:
+        journal_scores, journal_ids = journal_index.search(qv, min(5, len(journal_docs)))
+        existing_chunks = {d.get("chunk_id") for d in journal_results}
 
-def retrieve_docs(query: str, final_k: int = 15) -> List[dict]:
-    budget = extract_budget(query)
-    requested_category = detect_requested_category(query)
-    base_docs = base_retrieve_docs(query, k=30)
-    final_docs = rerank_docs(
-        query=query,
-        docs=base_docs,
-        budget=budget,
-        requested_category=requested_category,
-        final_k=final_k,
-    )
-    return final_docs
+        for score, idx in zip(journal_scores[0], journal_ids[0]):
+            if idx < 0:
+                continue
 
+            doc = dict(journal_docs[idx])
+            if doc.get("chunk_id") in existing_chunks:
+                continue
 
-def build_context(docs: List[dict]) -> str:
-    """
-    Context builder for LLM.
-    """
-    context_blocks = []
-    for i, doc in enumerate(docs, start=1):
-        context_blocks.append(f"[Dokumen {i}]\n{doc['text']}")
-    return "\n\n".join(context_blocks)
+            doc["base_score"] = float(score)
+            doc["score"] = float(score) + 0.03
+            journal_results.append(doc)
+
+    product_results.sort(key=lambda x: x["score"], reverse=True)
+    journal_results.sort(key=lambda x: x["score"], reverse=True)
+
+    return select_context_docs(product_results, journal_results, k)
+
+def build_context(docs: List[Dict[str, Any]]) -> str:
+    context_parts = []
+
+    for i, d in enumerate(docs, 1):
+        context_parts.append(
+            f"[Dokumen {i}]\n{shorten_text(d['text'])}"
+        )
+
+    return "\n\n".join(context_parts)
 
 # =====================================================
-# 6. GENERATION
+# 8. GENERATION
 # =====================================================
-def generate_recommendation(user_query: str, context: str) -> str:
-    system_prompt = """
-Anda adalah GlowAI, asisten rekomendasi skincare berbasis data.
+def build_prompt(
+    jumlah_produk: int,
+    budget: Optional[float] = None,
+    category: Optional[str] = None,
+    concerns: Optional[List[str]] = None,
+) -> str:
+    concerns = concerns or []
+
+    budget_rule = ""
+    if budget is not None:
+        budget_rule = f"""
+ATURAN BUDGET WAJIB:
+- Pengguna menyebut budget maksimal {format_rp(budget)}.
+- JANGAN menampilkan produk dengan harga di atas {format_rp(budget)} dalam kondisi apa pun.
+- JANGAN menampilkan produk dengan harga tidak tersedia jika pengguna menyebut budget.
+- Jika tidak ada produk yang sesuai budget dalam konteks, tulis bahwa produk sesuai budget tidak ditemukan.
+""".strip()
+
+    category_rule = ""
+    if category is not None:
+        category_rule = f"""
+ATURAN KATEGORI WAJIB:
+- Pengguna meminta kategori {category}.
+- JANGAN menampilkan produk dari kategori lain.
+""".strip()
+
+    clinical_rules = f"""
+ATURAN DERMATOLOGI:
+- Kondisi terdeteksi: {", ".join(concerns) if concerns else "tidak spesifik"}.
+- Untuk jerawat meradang/nyeri: prioritaskan kandungan anti-inflamasi atau acne treatment seperti salicylic acid, benzoyl peroxide, azelaic acid, sulfur, zinc, niacinamide, centella/cica jika tersedia. Jangan hanya memilih produk pencerah.
+- Untuk bruntusan/komedo: prioritaskan BHA/salicylic acid. Jika ada AHA/BHA, wajib beri catatan pemakaian bertahap.
+- Untuk bekas jerawat/kusam/PIH: prioritaskan vitamin C, niacinamide, alpha arbutin, azelaic acid, tranexamic acid, atau retinol jika tersedia. Wajib sebut sunscreen pada catatan.
+- Untuk kulit kering/ketarik: prioritaskan hyaluronic acid, glycerin, ceramide, panthenol, squalane, aloe, atau centella/cica.
+- Untuk kulit sensitif: prioritaskan soothing dan barrier repair seperti centella/cica, panthenol, ceramide, aloe, hyaluronic acid. Hindari rekomendasi yang terlalu agresif.
+- Untuk kulit kombinasi: pilih pelembap ringan yang menghidrasi tanpa terlalu oklusif, serta boleh mengandung niacinamide/hyaluronic acid.
+- Untuk kulit normal/maintenance: jangan over-treatment. Prioritaskan basic skincare, hidrasi, skin barrier, dan sunscreen. Hindari AHA/BHA/retinol kecuali user eksplisit meminta.
+- Untuk pori-pori besar: jelaskan bahwa pori tidak bisa dikecilkan permanen, hanya tampilan pori dapat dibantu dengan oil control dan unclog pores.
+- Jangan memilih produk hanya karena masih berkaitan umum dengan kondisi kulit. Prioritaskan produk yang memiliki bahan aktif langsung sesuai masalah utama pengguna.
+- Untuk bekas jerawat/PIH, produk tanpa bahan brightening aktif seperti vitamin C, niacinamide, alpha arbutin, azelaic acid, tranexamic acid, retinol, atau licorice hanya boleh direkomendasikan jika tidak ada pilihan lain.
+- Untuk jerawat meradang, jangan prioritaskan produk anti-aging, whitening umum, atau barrier-only jika masih ada produk dengan salicylic acid, benzoyl peroxide, azelaic acid, sulfur, zinc, tea tree, centella, atau niacinamide.
+- Untuk bruntusan/komedo, toner antioksidan atau soothing-only bukan prioritas utama kecuali tidak tersedia toner dengan BHA/AHA/salicylic acid.
+- Untuk kulit sensitif, hindari bahan aktif konsentrasi tinggi seperti niacinamide 10%, vitamin C kuat, AHA/BHA, dan retinol sebagai rekomendasi utama kecuali konteks produk jelas menyatakan aman untuk kulit sensitif.
+- Jika pengguna hamil, menyusui, atau sedang program hamil, jangan merekomendasikan produk yang mengandung retinol, retinal, retinoid, tretinoin, adapalene, atau tazarotene. Berikan alternatif non-retinoid dan sarankan konsultasi dokter.
+- Jika pengguna mengalami iritasi, perih, merah, atau rusak barrier setelah exfoliating toner, jangan merekomendasikan AHA, BHA, PHA, salicylic acid, glycolic acid, lactic acid, retinol, atau tea tree sebagai pilihan utama. Fokus pada barrier repair dan soothing.
+- Jangan menyatakan bahwa niacinamide, hyaluronic acid, atau cleanser biasa meningkatkan sensitivitas UV. Sunscreen tetap disarankan untuk perlindungan umum dan hiperpigmentasi.
+- Jika pengguna hamil, menyusui, atau sedang program hamil, jangan merekomendasikan produk yang mengandung retinol, retinal, retinoid, tretinoin, adapalene, atau tazarotene. Berikan alternatif non-retinoid dan sarankan konsultasi dokter kandungan atau dokter kulit.
+- Jika pengguna mengalami iritasi, perih, merah, atau rusak barrier setelah exfoliating toner, jangan merekomendasikan AHA, BHA, PHA, salicylic acid, glycolic acid, lactic acid, retinol, atau tea tree sebagai pilihan utama. Fokus pada barrier repair dan soothing.
+- Jangan menyatakan bahwa hidrasi, moisturizer, hyaluronic acid, glycerin, ceramide, niacinamide, atau cleanser biasa meningkatkan sensitivitas terhadap UV. Sunscreen disarankan untuk perlindungan harian dan pencegahan hiperpigmentasi, bukan karena bahan tersebut membuat kulit fotosensitif.
+- Gunakan dokumen bertanda [SUMBER: JURNAL DERMATOLOGI] sebagai dasar "Alasan Dermatologis (Jurnal)" pada setiap produk. Jika dokumen jurnal tidak cukup spesifik, tulis alasan umum yang aman berdasarkan jurnal dan jangan mengarang kutipan.
+- - Jika pengguna meminta produk yang "menyembuhkan jerawat permanen", "menghilangkan jerawat selamanya", atau klaim absolut sejenis, jelaskan di awal bahwa tidak ada skincare yang dapat menjamin kesembuhan permanen. Jika tetap memberi rekomendasi, posisikan produk hanya untuk membantu mengontrol jerawat, minyak, komedo, dan inflamasi.
+""".strip()
+
+    return f"""
+Anda adalah GlowAI, asisten rekomendasi skincare berbasis data dan prinsip dermatologi dasar.
 
 ATURAN UTAMA:
 1. Jawab HANYA berdasarkan konteks yang diberikan.
-2. Jangan menambahkan produk, harga, kandungan, atau klaim yang tidak ada di konteks.
-3. Fokuskan alasan rekomendasi pada masalah utama pengguna.
-4. Jika pengguna menyebut budget, prioritaskan hanya produk yang sesuai budget.
-5. Jika jumlah produk yang sesuai kurang dari 3, tulis catatan:
-   "Rekomendasi disesuaikan dengan data yang tersedia pada basis pengetahuan sistem."
-6. Jangan memberi diagnosis medis profesional.
-7. Berikan jawaban yang ringkas, jelas, dan terstruktur.
+2. Jangan mengarang nama produk, harga, kandungan, atau link produk.
+3. Jangan membuat produk generik seperti "Vitamin C Serum" jika nama produk tidak ada di konteks.
+4. Fokus hanya pada empat kategori produk: facial wash, toner, serum, dan moisturizer.
+5. Jika pengguna menyebut kategori produk, gunakan hanya kategori tersebut.
+6. Jika pengguna menyebut budget, patuhi budget secara ketat.
+7. Tampilkan maksimal {jumlah_produk} produk yang paling relevan.
+8. Jika data yang benar-benar sesuai kurang dari {jumlah_produk}, tampilkan yang tersedia saja lalu beri catatan keterbatasan data.
+9. Pada bagian "Kandungan Kunci", tulis bahan aktif atau kandungan penting, bukan tekstur produk.
+10. Pada bagian "Alasan Kesesuaian Produk", jelaskan singkat mengapa produk cocok dengan kebutuhan pengguna berdasarkan kandungan dan kategori produk.
+11. Jangan memberi diagnosis medis profesional.
+12. Jangan menyebut produk sebagai obat atau terapi medis definitif.
+13. Jika link tidak tersedia di konteks, tulis "Link tidak tersedia dalam basis data", jangan mengarang link.
+14. Jangan menulis harga Rp0. Jika harga tidak ada, tulis "Harga tidak tersedia".
+15. Jika budget terdeteksi, hanya rekomendasikan produk yang harga eksplisitnya berada di bawah atau sama dengan budget.
+16. Jika semua produk pada konteks melebihi budget, jangan rekomendasikan produk apa pun dan gunakan catatan keterbatasan data.
+17. Jangan menampilkan proses berpikir internal, chain-of-thought, atau penalaran tersembunyi. Tampilkan jawaban final saja.
+18. Gunakan bahasa ringkas. Analisis maksimal 2 kalimat, setiap alasan maksimal 1 kalimat per produk, dan Catatan maksimal 2 poin.
+19. Jangan menampilkan produk yang memiliki status discontinued/tidak diproduksi lagi.
+20. Jangan menyatakan produk aman untuk ibu hamil secara absolut. Untuk kehamilan/menyusui, sarankan konsultasi dengan dokter kandungan atau dokter kulit sebelum memakai bahan aktif.
+21. Jangan menjanjikan hasil instan seperti putih dalam 3 hari, bekas jerawat hilang cepat, atau jerawat sembuh permanen. Berikan ekspektasi realistis bahwa perubahan kulit biasanya memerlukan beberapa minggu.
+22. Jangan menggunakan klaim "menyembuhkan permanen". Untuk jerawat, jelaskan bahwa kondisi dapat dikontrol/dikelola dan dapat kambuh tergantung hormon, kebiasaan, dan faktor kulit.
+23. Jika kandungan kunci tidak tersedia dalam basis data, jangan memberi alasan medis yang terlalu spesifik. Tulis bahwa alasan rekomendasi terbatas karena data kandungan tidak lengkap.
+24. Buat satu bagian "Alasan Dermatologis Berdasarkan Jurnal" setelah daftar rekomendasi. Bagian ini harus merangkum prinsip dermatologi dari dokumen jurnal, bukan diulang pada setiap produk.
 
-FORMAT OUTPUT WAJIB:
+{clinical_rules}
+
+{budget_rule}
+
+{category_rule}
+
+FORMAT JAWABAN:
 ### Analisis Kulit
-[analisis singkat kondisi kulit pengguna]
+[analisis singkat masalah utama pengguna]
 
 ### Rekomendasi
 1. **Nama Produk**
-   - **Harga:** ...
-   - **Kandungan Kunci:** ...
-   - **Alasan Medis:** ...
-   - **Link Produk:** ...
+- **Harga:** ...
+- **Kandungan Kunci:** ...
+- **Alasan Kesesuaian Produk:** ...
+- **Link Produk:** ...
 
-2. **Nama Produk**
-   - **Harga:** ...
-   - **Kandungan Kunci:** ...
-   - **Alasan Medis:** ...
-   - **Link Produk:** ...
+### Alasan Dermatologis Berdasarkan Jurnal
+[maksimal 2-3 poin ringkas berdasarkan dokumen bertanda [SUMBER: JURNAL DERMATOLOGI]]
 
-3. **Nama Produk**
-   - **Harga:** ...
-   - **Kandungan Kunci:** ...
-   - **Alasan Medis:** ...
-   - **Link Produk:** ...
-
-### Catatan
-[jika diperlukan]
+### Catatan Ringkas
+[maksimal 2 poin catatan keamanan, batasan data, sunscreen, patch test, atau frekuensi pemakaian jika relevan]
 """.strip()
 
-    user_message = f"""
+
+def call_model(
+    model_id: str,
+    user_query: str,
+    context: str,
+    jumlah_produk: int,
+    budget: Optional[float],
+    category: Optional[str],
+    concerns: List[str],
+) -> str:
+    prompt = build_prompt(jumlah_produk, budget, category, concerns)
+
+    msg = f"""
 PERTANYAAN PENGGUNA:
 {user_query}
 
@@ -497,103 +833,199 @@ KONTEKS:
 """.strip()
 
     res = client.chat.completions.create(
-        model=FINAL_MODEL_ID,
+        model=model_id,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": msg},
         ],
-        temperature=0.2,
-        max_tokens=1200,
+        temperature=0.05,
+        max_tokens=MAX_OUTPUT_TOKENS,
     )
+
     return res.choices[0].message.content.strip()
 
-# =====================================================
-# 7. MAIN UI
-# =====================================================
-st.markdown(
-    f"""
-<div class="main-header">
-    <h1>✨ GlowAI Skincare Expert</h1>
-    <p>Sistem Rekomendasi Berbasis RAG, FAISS, dan {html.escape(FINAL_MODEL_NAME)}</p>
-</div>
-""",
-    unsafe_allow_html=True,
-)
 
+def generate_answer(
+    user_query: str,
+    context: str,
+    jumlah_produk: int,
+    budget: Optional[float],
+    category: Optional[str],
+    concerns: List[str],
+) -> Tuple[str, str]:
+        answer = call_model(PRIMARY_MODEL_ID, user_query, context, jumlah_produk, budget, category, concerns)
+        return answer, "OpenAI GPT OSS 120B"
+
+def append_safety_notes(answer: str, concerns: List[str], category: Optional[str]) -> str:
+    safety = generate_safety_notes(concerns, category)
+
+    if not safety:
+        return answer
+
+    if "### Catatan" in answer or "### Catatan Ringkas" in answer:
+        return answer.strip()
+
+    return answer.strip() + "\n\n### Catatan Ringkas\n" + safety
+
+
+# =====================================================
+# 9. UI
+# =====================================================
 st.markdown(
     """
-<div class="info-card">
-<b>Petunjuk:</b> Jelaskan keluhan kulit Anda dan, jika perlu, sertakan kategori produk atau budget.
-Contoh: <i>"Rekomendasikan 3 serum untuk bekas jerawat dengan budget di bawah 50 ribu."</i>
-</div>
-""",
+    <div class="info-box">
+    <b>Petunjuk:</b> Tulis kebutuhan skincare secara spesifik, termasuk kategori produk, jumlah rekomendasi, atau budget jika perlu.<br><br>
+    <b>Kategori tersedia:</b> facial wash, toner, serum, moisturizer.<br><br>
+    Contoh:
+    <ul>
+      <li>Rekomendasikan 3 moisturizer untuk kulit kering yang terasa ketarik setelah mencuci muka.</li>
+      <li>Kasih 2 serum untuk bekas jerawat dengan budget di bawah 50 ribu.</li>
+      <li>Berikan 4 toner untuk bruntusan di dahi dan pipi.</li>
+      <li>Carikan facial wash untuk kulit berminyak dan mudah berjerawat.</li>
+      <li>Rekomendasikan serum untuk kulit kusam dengan pori-pori besar.</li>
+    </ul>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
 user_input = st.text_area(
-    "💬 Ceritakan keluhan atau kebutuhan skincare Anda:",
-    placeholder=(
-        "Contoh: Rekomendasikan 3 produk moisturizer untuk kulit kering yang terasa "
-        "ketarik setelah mencuci muka."
-    ),
-    height=130,
+    "💬 Masukkan kebutuhan skincare Anda",
+    placeholder="Contoh: Rekomendasikan 3 serum untuk bekas jerawat dengan budget di bawah 100 ribu.",
+    height=150,
 )
 
 if st.button("Analisis & Rekomendasi", type="primary"):
-    is_valid, validation_msg = validate_input(user_input)
-    if not is_valid:
-        st.error(validation_msg)
+    ok, msg = validate_input(user_input)
+
+    if not ok:
+        st.error(msg)
         st.stop()
 
+    jumlah_produk = extract_requested_count(user_input)
     budget = extract_budget(user_input)
-    category = detect_requested_category(user_input)
+    category = detect_category(user_input)
+    concerns = detect_skin_concerns(user_input)
 
-    with st.status("🛡️ Menjalankan validasi input...", expanded=False) as status:
-        status.write("Topik terdeteksi sesuai domain skincare.")
-        if budget is not None:
-            status.write(f"Budget terdeteksi: {format_rupiah(budget)}")
-        if category is not None:
-            status.write(f"Kategori produk terdeteksi: {category}")
-        status.update(label="✅ Validasi input selesai", state="complete")
+    with st.spinner("📚 Mencari dokumen relevan..."):
+        docs = retrieve(user_input, k=TOPK_CONTEXT)
 
-    with st.spinner("📚 Melakukan semantic retrieval dan re-ranking..."):
-        retrieved_docs = retrieve_docs(user_input, final_k=15)
+    product_count = count_product_docs(docs)
+    journal_count = count_journal_docs(docs)
 
-    if not retrieved_docs:
-        st.warning("Tidak ditemukan dokumen yang relevan pada basis pengetahuan.")
-        st.markdown(
-            f'<div class="warning-card">{fallback_response(user_input, budget)}</div>',
-            unsafe_allow_html=True,
-        )
+    if product_count == 0:
+        st.warning("Tidak ditemukan produk yang memenuhi kategori dan/atau budget yang diminta.")
+        st.markdown(fallback_response(jumlah_produk, category, budget, concerns))
         st.stop()
 
-    context_str = build_context(retrieved_docs)
+    context = build_context(docs)
 
-    with st.spinner(f"🤖 Menghasilkan rekomendasi dengan {FINAL_MODEL_NAME}..."):
+    with st.spinner("🤖 Menyusun rekomendasi..."):
         try:
-            response = generate_recommendation(user_input, context_str)
+            answer, model_used = generate_answer(
+                user_input,
+                context,
+                jumlah_produk,
+                budget,
+                category,
+                concerns,
+            )
         except Exception as e:
-            st.error(f"Terjadi kesalahan saat generate jawaban: {e}")
+            st.error(f"Gagal generate jawaban: {e}")
             st.stop()
 
-    # Output validation + fallback
-    if not is_output_valid(response):
-        response = fallback_response(user_input, budget)
+    if not valid_output(answer) or answer_violates_budget(answer, budget) or answer_looks_incomplete(answer):
+        answer = fallback_response(jumlah_produk, category, budget, concerns)
 
-    st.markdown(f'<div class="result-card">{response}</div>', unsafe_allow_html=True)
+    answer = append_safety_notes(answer, concerns, category)
 
-    with st.expander("🔎 Transparansi Dokumen Retrieval"):
-        for i, doc in enumerate(retrieved_docs, start=1):
-            meta = (
-                f"Skor: {doc.get('hybrid_score', 0):.3f} | "
-                f"Sumber: {doc.get('source', '-')}"
-            )
-            if doc.get("price") is not None:
-                meta += f" | Harga: {format_rupiah(doc['price'])}"
-            if doc.get("category"):
-                meta += f" | Kategori: {doc['category']}"
-            st.markdown(f"**Dokumen {i}** — {meta}")
-            st.caption(doc["text"][:400] + ("..." if len(doc["text"]) > 400 else ""))
+    st.markdown(f"<div class='result-box'>{answer}</div>", unsafe_allow_html=True)
+
+    st.caption(
+        f"Model yang digunakan: {model_used} | "
+        f"Jumlah rekomendasi terdeteksi: {jumlah_produk} | "
+        f"Kategori: {category if category else 'Tidak disebutkan'} | "
+        f"Budget: {format_rp(budget) if budget is not None else 'Tidak disebutkan'} | "
+        f"Kondisi terdeteksi: {', '.join(concerns) if concerns else 'Tidak spesifik'} | "
+        f"Dokumen konteks: {len(docs)} | "
+        f"Jurnal konteks: {journal_count}"
+    )
+
+    with st.expander("🔎 Transparansi Retrieval (Explainable RAG)"):
+        st.markdown("### 📊 Informasi Retrieval")
+        st.write(f"- **Kategori terdeteksi:** {category if category else 'Tidak disebutkan'}")
+        st.write(f"- **Budget terdeteksi:** {format_rp(budget) if budget is not None else 'Tidak disebutkan'}")
+        st.write(f"- **Kondisi kulit terdeteksi:** {', '.join(concerns) if concerns else 'Tidak spesifik'}")
+        st.write(f"- **Jumlah rekomendasi diminta:** {jumlah_produk}")
+        st.write(f"- **Initial retrieval:** {INITIAL_RETRIEVAL}")
+        st.write(f"- **Top-k context ke LLM:** {TOPK_CONTEXT}")
+        st.write(f"- **Minimum similarity score:** {MIN_SIMILARITY_SCORE}")
+        st.write(f"- **Jumlah dokumen konteks yang digunakan:** {len(docs)}")
+        st.write(f"- **Jumlah dokumen produk valid:** {product_count}")
+        st.write(f"- **Jumlah dokumen jurnal:** {journal_count}")
+
+        st.markdown("---")
+        st.markdown("### 📄 Detail Dokumen yang Digunakan")
+
+        for i, d in enumerate(docs, 1):
+            explanation = []
+
+            if category and d.get("category") and category == d["category"]:
+                explanation.append("✔ kategori sesuai")
+
+            if budget and d.get("price") is not None and d["price"] <= budget:
+                explanation.append("✔ sesuai budget")
+
+            if d.get("source") == "jurnal":
+                explanation.append("✔ referensi medis")
+
+            if d.get("source") == "produk":
+                explanation.append("✔ relevansi klinis berdasarkan kondisi kulit")
+
+            if not explanation:
+                explanation.append("relevansi semantik umum")
+
+            explanation_text = ", ".join(explanation)
+
+            meta_lines = [
+                f"**Dokumen {i}**",
+                f"- Base score: `{d.get('base_score', 0):.3f}`",
+                f"- Final score: `{d.get('score', 0):.3f}`",
+                f"- Sumber: `{d.get('source', '-')}`",
+            ]
+
+            if d.get("product_name"):
+                meta_lines.append(f"- Produk: `{d['product_name']}`")
+
+            if d.get("brand"):
+                meta_lines.append(f"- Brand: `{d['brand']}`")
+
+            if d.get("category"):
+                meta_lines.append(f"- Kategori: `{d['category']}`")
+            if d.get("topic"):
+                meta_lines.append(f"- Topik jurnal: `{d['topic']}`")
+
+            if d.get("source_file"):
+                meta_lines.append(f"- File jurnal: `{d['source_file']}`")
+
+            if d.get("page"):
+                meta_lines.append(f"- Halaman: `{d['page']}`")
+
+            raw_price = d.get("raw_price", "")
+
+            if d.get("price") is not None:
+                meta_lines.append(f"- Harga: `{format_rp(d['price'])}`")
+            elif raw_price:
+                meta_lines.append(f"- Harga: `{raw_price}`")
+
+            if d.get("url"):
+                meta_lines.append(f"- Link: {d['url']}")
+
+            meta_lines.append(f"- Alasan dipilih: **{explanation_text}**")
+
+            st.markdown("\n".join(meta_lines))
+            st.caption(d["text"][:350] + ("..." if len(d["text"]) > 350 else ""))
+            st.markdown("---")
 
 st.markdown("---")
-st.caption("© 2025 GlowAI Research Project. Prototipe sistem rekomendasi skincare berbasis RAG.")
+st.caption("© 2025 GlowAI Research Project") 

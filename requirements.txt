@@ -1,11 +1,9 @@
 streamlit
 pandas
-numpy==1.26.4
+numpy>=2.0
 faiss-cpu
 PyPDF2
 sentence-transformers
-torch==2.1.2
-torchvision==0.16.2
 transformers
 groq
 python-dotenv
