@@ -7,7 +7,6 @@ import faiss
 import pandas as pd
 import streamlit as st
 from groq import Groq
-from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 # =====================================================
