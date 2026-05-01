@@ -1,11 +1,13 @@
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import faiss
 import pandas as pd
 import streamlit as st
 from groq import Groq
+from openai import OpenAI
 from sentence_transformers import SentenceTransformer
 
 # =====================================================
@@ -28,7 +30,7 @@ st.markdown(
 
     /* ── Layout width ── */
     .block-container {
-        max-width: 1000px !important;
+        max-width: 960px !important;
         padding-left: 3rem !important;
         padding-right: 3rem !important;
         padding-top: 4rem !important;
@@ -220,11 +222,109 @@ st.markdown(
         margin-top: 4rem;
         padding-bottom: 2.5rem;
     }
+
+    /* ── MOBILE RESPONSIVE ── */
+    @media (max-width: 768px) {
+        .block-container {
+            max-width: 100% !important;
+            padding-left: 1rem !important;
+            padding-right: 1rem !important;
+            padding-top: 1.5rem !important;
+        }
+
+        .main-wordmark {
+            font-size: 3rem !important;
+            margin-top: 1rem !important;
+            margin-bottom: 0.2rem !important;
+        }
+
+        .subtitle {
+            font-size: 0.7rem !important;
+            letter-spacing: 0.14em !important;
+            margin-bottom: 1.5rem !important;
+        }
+
+        .info-box {
+            padding: 20px 18px !important;
+            font-size: 0.9rem !important;
+            margin-bottom: 1.25rem !important;
+        }
+
+        .info-box .info-title {
+            font-size: 0.85rem !important;
+        }
+
+        .info-box li {
+            font-size: 0.88rem !important;
+            margin-bottom: 0.4rem !important;
+        }
+
+        .chip {
+            font-size: 0.7rem !important;
+            padding: 5px 10px !important;
+        }
+
+        .result-box {
+            padding: 20px 18px !important;
+            font-size: 0.92rem !important;
+            line-height: 1.75 !important;
+            margin-top: 1.25rem !important;
+        }
+
+        .meta-strip {
+            font-size: 0.7rem !important;
+            line-height: 1.6 !important;
+        }
+
+        div[data-testid="stTextArea"] textarea {
+            font-size: 0.95rem !important;
+            padding: 12px 14px !important;
+        }
+
+        div[data-testid="stTextArea"] label {
+            font-size: 0.75rem !important;
+        }
+
+        .stButton > button {
+            width: 100% !important;
+            font-size: 0.8rem !important;
+            padding: 13px 20px !important;
+        }
+
+        .footer-note {
+            font-size: 0.65rem !important;
+            margin-top: 2rem !important;
+        }
+    }
+
+    @media (max-width: 480px) {
+        .main-wordmark {
+            font-size: 2.4rem !important;
+        }
+
+        .subtitle {
+            font-size: 0.62rem !important;
+            letter-spacing: 0.1em !important;
+        }
+
+        .info-box {
+            padding: 16px 14px !important;
+        }
+
+        .result-box {
+            padding: 16px 14px !important;
+            font-size: 0.88rem !important;
+        }
+    }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+st.markdown(
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">',
+    unsafe_allow_html=True,
+)
 st.markdown("<div class='main-wordmark'>Glow<span>AI</span></div>", unsafe_allow_html=True)
 st.markdown(
     "<div class='subtitle'>Sistem Rekomendasi Skincare &mdash; RAG &middot; FAISS &middot; LLM</div>",
@@ -234,11 +334,17 @@ st.markdown(
 # =====================================================
 # 2. CONFIG
 # =====================================================
-PRIMARY_MODEL_ID = "openai/gpt-oss-120b"
+PRIMARY_MODEL_ID = "llama-3.3-70b-versatile"
+BACKUP_MODEL_ID = "openai/gpt-oss-120b"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
-CSV_PATH = "datasets/dokumen_produk.csv"
-JOURNAL_CSV_PATH = "datasets/jurnal_chunk.csv"
+# Google Drive file IDs
+GDRIVE_PRODUK_ID  = "1uzt2pxhB4WBmQySfNAh3V40YIvXynmLs"
+GDRIVE_JURNAL_ID  = "1Sb2lgFLrWaAIyBx6BP3t1GbtIBa5lHXM"
+
+CSV_PATH          = "datasets/dokumen_produk.csv"
+JOURNAL_CSV_PATH  = "datasets/jurnal_chunk.csv"
 
 INITIAL_RETRIEVAL = 50
 TOPK_CONTEXT = 5
@@ -253,6 +359,45 @@ MAX_OUTPUT_TOKENS = 1200
 ALLOWED_CATEGORIES = ["facewash", "toner", "serum", "moisturizer"]
 
 # =====================================================
+# 2b. DATASET DOWNLOAD FROM GOOGLE DRIVE
+# =====================================================
+def _gdrive_direct(file_id: str) -> str:
+    return f"https://drive.google.com/uc?export=download&id={file_id}"
+
+
+@st.cache_resource(show_spinner=False)
+def ensure_datasets() -> None:
+    """Download CSVs from Google Drive if not already present locally."""
+    import urllib.request
+
+    pairs = [
+        (GDRIVE_PRODUK_ID,  CSV_PATH),
+        (GDRIVE_JURNAL_ID,  JOURNAL_CSV_PATH),
+    ]
+
+    for file_id, local_path in pairs:
+        path = Path(local_path)
+        if path.exists():
+            continue
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        url = _gdrive_direct(file_id)
+
+        try:
+            urllib.request.urlretrieve(url, local_path)
+        except Exception as e:
+            st.error(
+                f"Gagal mengunduh dataset dari Google Drive: {local_path}\n"
+                f"Error: {e}\n\n"
+                "Pastikan file Google Drive sudah diset 'Anyone with the link can view'."
+            )
+            st.stop()
+
+
+with st.spinner("Memuat dataset..."):
+    ensure_datasets()
+
+# =====================================================
 # 3. CLIENT
 # =====================================================
 groq_key = st.secrets.get("GROQ_API_KEY", "")
@@ -260,7 +405,18 @@ if not groq_key:
     st.error("GROQ_API_KEY tidak ditemukan di secrets.toml")
     st.stop()
 
-client = Groq(api_key=groq_key)
+openrouter_key = st.secrets.get("OPENROUTER_API_KEY", "")
+
+groq_client = Groq(api_key=groq_key)
+
+openrouter_client = (
+    OpenAI(
+        api_key=openrouter_key,
+        base_url=OPENROUTER_BASE_URL,
+    )
+    if openrouter_key
+    else None
+)
 
 # =====================================================
 # 4. BASIC HELPERS
@@ -1020,6 +1176,7 @@ def call_model(
     budget: Optional[float],
     category: Optional[str],
     concerns: List[str],
+    use_openrouter: bool = False,
 ) -> str:
     prompt = build_prompt(jumlah_produk, budget, category, concerns)
 
@@ -1031,7 +1188,9 @@ KONTEKS:
 {context}
 """.strip()
 
-    res = client.chat.completions.create(
+    active_client = openrouter_client if use_openrouter else groq_client
+
+    res = active_client.chat.completions.create(
         model=model_id,
         messages=[
             {"role": "system", "content": prompt},
@@ -1052,8 +1211,27 @@ def generate_answer(
     category: Optional[str],
     concerns: List[str],
 ) -> Tuple[str, str]:
-    answer = call_model(PRIMARY_MODEL_ID, user_query, context, jumlah_produk, budget, category, concerns)
-    return answer, "OpenAI GPT OSS 120B"
+    # Primary: Groq (llama-3.3-70b-versatile)
+    try:
+        answer = call_model(
+            PRIMARY_MODEL_ID, user_query, context,
+            jumlah_produk, budget, category, concerns,
+            use_openrouter=False,
+        )
+        return answer, f"Groq / {PRIMARY_MODEL_ID}"
+    except Exception as primary_err:
+        # Backup: OpenRouter (openai/gpt-oss-120b)
+        if openrouter_client is None:
+            raise RuntimeError(
+                f"Model utama gagal: {primary_err}. "
+                "OPENROUTER_API_KEY tidak ditemukan di secrets.toml untuk fallback."
+            )
+        answer = call_model(
+            BACKUP_MODEL_ID, user_query, context,
+            jumlah_produk, budget, category, concerns,
+            use_openrouter=True,
+        )
+        return answer, f"OpenRouter / {BACKUP_MODEL_ID} (fallback)"
 
 
 def append_safety_notes(answer: str, concerns: List[str], category: Optional[str]) -> str:
@@ -1096,7 +1274,7 @@ st.markdown(
 user_input = st.text_area(
     "Masukkan kebutuhan skincare Anda",
     placeholder="Contoh: Rekomendasikan 3 serum untuk bekas jerawat dengan budget di bawah 100 ribu.",
-    height=80,
+    height=200,
 )
 
 if st.button("Analisis dan Rekomendasikan", type="primary"):
