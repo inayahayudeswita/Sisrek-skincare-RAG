@@ -391,7 +391,7 @@ st.markdown(
 # =====================================================
 # 2. CONFIG
 # =====================================================
-PRIMARY_MODEL_ID = "openai/gpt-oss-120b"
+PRIMARY_MODEL_ID = "llama-3.3-70b-versatile"
 EMBED_MODEL = "all-MiniLM-L6-v2"
 
 CSV_PATH = "datasets/dokumen_produk.csv"
@@ -685,7 +685,6 @@ def clinical_score_boost(doc_text: str, concerns: List[str]) -> float:
     if any(c in concerns for c in ["inflamed_acne", "acne", "comedonal_acne"]) and "bengkoang" in t:
         boost -= 0.12
     return boost
-
 
 def generate_safety_notes(concerns: List[str], category: Optional[str]) -> str:
     notes = []
@@ -1011,7 +1010,7 @@ def generate_answer(
     concerns: List[str],
 ) -> Tuple[str, str]:
     answer = call_model(PRIMARY_MODEL_ID, user_query, context, jumlah_produk, budget, category, concerns)
-    return answer, "OpenAI GPT OSS 120B"
+    return answer, "Llama 3.3 70B"
 
 
 def append_safety_notes(answer: str, concerns: List[str], category: Optional[str]) -> str:
@@ -1165,4 +1164,4 @@ if st.button("Analisis dan Rekomendasikan", type="primary"):
             st.caption(d["text"][:350] + ("..." if len(d["text"]) > 350 else ""))
             st.markdown("---")
 
-st.markdown("<div class='footer-note'>GlowAI Research Project &mdash; 2025</div>", unsafe_allow_html=True)
+st.markdown("<div class='footer-note'>GlowAI &mdash; 2026</div>", unsafe_allow_html=True)
